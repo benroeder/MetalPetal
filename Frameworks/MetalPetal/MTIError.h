@@ -55,7 +55,13 @@ typedef NS_ERROR_ENUM(MTIErrorDomain, MTIError) {
     MTIErrorInvalidTextureDimension = 5008,
         
     //For features not available on iOS simulator.
-    MTIErrorFeatureNotAvailableOnSimulator = 6001
+    MTIErrorFeatureNotAvailableOnSimulator = 6001,
+
+    //A C++ exception escaped the render graph. Reported rather than
+    //allowed to unwind: the callers of this library are Swift, and a C++
+    //exception crossing into Swift frames is undefined behaviour, so the
+    //process terminates instead of surfacing an error.
+    MTIErrorRenderGraphException = 7001
 };
 
 /// Create a NSError with MTIErrorDomain and the specified error code and user info. Creating a symbolic breakpoint for `_MTIErrorCreate` can help you locate the source of the error.

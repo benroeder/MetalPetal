@@ -21,13 +21,19 @@ let package = Package(
         .target(
             name: "MetalPetalObjectiveC",
             dependencies: []),
+        //ObjC++ so it can throw a real C++ exception at the render graph —
+        //Swift cannot, and a target cannot mix languages.
+        .target(
+            name: "MetalPetalThrowingPromise",
+            dependencies: ["MetalPetalObjectiveC"],
+            path: "Tests/MetalPetalThrowingPromise"),
         .target(
             name: "MetalPetalTestHelpers",
             dependencies: ["MetalPetal"],
             path: "Tests/MetalPetalTestHelpers"),
         .testTarget(
             name: "MetalPetalTests",
-            dependencies: ["MetalPetal", "MetalPetalTestHelpers"]),
+            dependencies: ["MetalPetal", "MetalPetalTestHelpers", "MetalPetalThrowingPromise"]),
     ],
     cxxLanguageStandard: .cxx14
 )
