@@ -15,6 +15,7 @@
 #import "MTIImagePromiseDebug.h"
 
 #include <unordered_map>
+#include <exception>
 #include <vector>
 #include <memory>
 #include <cstdint>
@@ -213,7 +214,42 @@ MTIContextImageAssociatedValueTableName const MTIContextImagePersistentResolutio
     return result;
 }
 
+//Every caller of this library is Swift, and a C++ exception unwinding
+//through Swift frames is undefined behaviour — the process terminates
+//rather than surfacing an error. So nothing may be allowed to throw out
+//of the render graph, and the catch has to live HERE, in ObjC++, because
+//Swift cannot catch it and MTIContext+Rendering.m is not compiled as C++.
+//
+//This is the floor, not a specific fix: the known case was std::map::at()
+//on a promise that had left the graph (see dependentCountForPromise), and
+//that one now returns instead of throwing. This guard means the NEXT
+//promise-lifetime bug anywhere in the graph costs a dropped frame and an
+//NSError rather than a crash. Seen in the field as a fatal
+//St12out_of_range during visualizer preset switching
+//(SlimController #414).
+//
+//Guarded at the OUTERMOST call only: the recursive descent below calls
+//the unguarded variant, so a deep graph does not pay a try/catch per
+//node, and an exception thrown at any depth still unwinds to here.
 - (id<MTIImagePromiseResolution>)resolutionForImage:(MTIImage *)image error:(NSError * __autoreleasing *)inOutError {
+    try {
+        return [self unguardedResolutionForImage:image error:inOutError];
+    } catch (const std::exception &exception) {
+        if (inOutError) {
+            *inOutError = MTIErrorCreate(MTIErrorRenderGraphException,
+                                         @{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"A C++ exception escaped the render graph: %s", exception.what()]});
+        }
+        return nil;
+    } catch (...) {
+        if (inOutError) {
+            *inOutError = MTIErrorCreate(MTIErrorRenderGraphException,
+                                         @{NSLocalizedDescriptionKey: @"An unknown C++ exception escaped the render graph."});
+        }
+        return nil;
+    }
+}
+
+- (id<MTIImagePromiseResolution>)unguardedResolutionForImage:(MTIImage *)image error:(NSError * __autoreleasing *)inOutError {
     if (image == nil) {
         [NSException raise:NSInvalidArgumentException format:@"%@: Application is requesting a resolution of a nil image.", self];
     }
@@ -273,7 +309,7 @@ MTIContextImageAssociatedValueTableName const MTIContextImagePersistentResolutio
                 
                 for (NSUInteger index = 0; index < dependencyCount; index += 1) {
                     MTIImage *image = promise.dependencies[index];
-                    id<MTIImagePromiseResolution> resolution = [self resolutionForImage:image error:&error];
+                    id<MTIImagePromiseResolution> resolution = [self unguardedResolutionForImage:image error:&error];
                     if (error) {
                         break;
                     }
