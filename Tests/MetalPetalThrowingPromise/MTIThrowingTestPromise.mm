@@ -2,14 +2,27 @@
 
 #include <stdexcept>
 
-@implementation MTIThrowingTestPromise
+@implementation MTIThrowingTestPromise {
+    NSArray<MTIImage *> *_dependencies;
+}
+
+- (instancetype)init {
+    return [self initWithDependencies:@[]];
+}
+
+- (instancetype)initWithDependencies:(NSArray<MTIImage *> *)dependencies {
+    if (self = [super init]) {
+        _dependencies = [dependencies copy];
+    }
+    return self;
+}
 
 - (MTITextureDimensions)dimensions {
     return MTITextureDimensionsMake2DFromCGSize(CGSizeMake(16, 16));
 }
 
 - (NSArray<MTIImage *> *)dependencies {
-    return @[];
+    return _dependencies;
 }
 
 - (MTIAlphaType)alphaType {
@@ -22,10 +35,11 @@
     //promise that had left the dependency graph threw St12out_of_range,
     //and nothing caught it.
     throw std::out_of_range("deliberate throw from a test promise");
+    return nil;
 }
 
 - (instancetype)promiseByUpdatingDependencies:(NSArray<MTIImage *> *)dependencies {
-    return self;
+    return [[MTIThrowingTestPromise alloc] initWithDependencies:dependencies];
 }
 
 - (id)copyWithZone:(NSZone *)zone {

@@ -27,11 +27,6 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (nullable id<MTIImagePromiseResolution>)resolutionForImage:(MTIImage *)image error:(NSError **)error;
 
-/// As `resolutionForImage:error:` but WITHOUT the C++ exception guard.
-/// For the recursive descent only, which runs inside the guarded
-/// outermost call — paying a try/catch per graph node buys nothing.
-- (nullable id<MTIImagePromiseResolution>)unguardedResolutionForImage:(MTIImage *)image error:(NSError **)error;
-
 @end
 
 NS_ASSUME_NONNULL_END

@@ -129,7 +129,19 @@ __attribute__((objc_subclassing_restricted))
 }
 
 - (void)dealloc {
-    NSAssert(self.invalidationHandler == nil, @"");
+    //Raising here during stack unwinding REPLACES the exception already
+    //in flight, so a diagnosable std::out_of_range from the graph
+    //arrives at the guard as a bare NSInternalInconsistencyException
+    //with the real cause destroyed — and only in debug builds, since
+    //NSAssert compiles out under NS_BLOCK_ASSERTIONS. That made the
+    //guard's diagnostics worse in debug than in release, which is
+    //backwards.
+    //
+    //Still reported, just not as an exception: an unconsumed resolution
+    //is a real leak of a render target and must not pass silently.
+    if (self.invalidationHandler != nil) {
+        MTIPrint(@"MTITransientImagePromiseResolution deallocated without being consumed — its render target was not released. This is expected only when an exception unwound out of the render graph.");
+    }
 }
 
 @end
@@ -171,8 +183,21 @@ MTIContextImageAssociatedValueTableName const MTIContextImagePersistentResolutio
     std::unordered_map<__unsafe_unretained MTIImage *, __unsafe_unretained id<MTLSamplerState>, MTIImageRendering::ObjcPointerHash, MTIImageRendering::ObjcPointerIdentityEqual> _currentDependencySamplerStateMap;
     
     __unsafe_unretained id<MTIImagePromise> _currentResolvingPromise;
+    //Set when an exception escaped resolution. The context is then
+    //unusable: a command encoder may be open, locals in ObjC (.m)
+    //frames have leaked, and the graph is half-built.
+    BOOL _graphDidThrow;
 }
 
+@end
+
+@interface MTIImageRenderingContext ()
+/// `resolutionForImage:error:` without the exception guard — the
+/// recursive descent only, which already runs inside the guarded
+/// outermost call. Deliberately NOT in the shared internal header: an
+/// explicitly unguarded way into the render graph is not something
+/// another translation unit should be able to reach for.
+- (nullable id<MTIImagePromiseResolution>)unguardedResolutionForImage:(MTIImage *)image error:(NSError **)error;
 @end
 
 @implementation MTIImageRenderingContext
@@ -180,6 +205,17 @@ MTIContextImageAssociatedValueTableName const MTIContextImagePersistentResolutio
 - (void)dealloc {
     delete _dependencyGraph;
     
+    //Do NOT commit after an escaped exception. Kernels create a render
+    //command encoder and call back into this context to resolve their
+    //inputs (MTIRenderPipelineKernel), with no @try around endEncoding —
+    //so an exception caught in resolutionForImage: leaves an encoder
+    //open on this command buffer. Committing one with an uncommitted
+    //encoder makes Metal abort, which would turn a survivable render
+    //failure into a crash in dealloc with no stack relationship to the
+    //cause.
+    if (_graphDidThrow) {
+        return;
+    }
     if (self.commandBuffer.status == MTLCommandBufferStatusNotEnqueued || self.commandBuffer.status == MTLCommandBufferStatusEnqueued) {
         [self.commandBuffer commit];
     }
@@ -197,7 +233,11 @@ MTIContextImageAssociatedValueTableName const MTIContextImagePersistentResolutio
 - (id<MTLTexture>)resolvedTextureForImage:(MTIImage *)image {
     auto promise = _currentResolvingPromise;
     NSAssert(promise != nil, @"");
-    auto result = _currentDependencyResolutionMap[image];
+    //find, not operator[]: the subscript default-constructs and INSERTS
+    //an entry for a missing image, growing the map and leaving a key
+    //that will dangle (the same bug fixed in removeDependentForPromise).
+    auto entry = _currentDependencyResolutionMap.find(image);
+    auto result = entry == _currentDependencyResolutionMap.end() ? nil : entry -> second;
     if (!result || !promise) {
         [NSException raise:NSInternalInconsistencyException format:@"Do not query resolved texture for image which is not the current resolving promise's dependency. (Promise: %@, Image: %@)", promise, image];
     }
@@ -207,7 +247,11 @@ MTIContextImageAssociatedValueTableName const MTIContextImagePersistentResolutio
 - (id<MTLSamplerState>)resolvedSamplerStateForImage:(MTIImage *)image {
     auto promise = _currentResolvingPromise;
     NSAssert(promise != nil, @"");
-    auto result = _currentDependencySamplerStateMap[image];
+    //find, not operator[]: the subscript default-constructs and INSERTS
+    //an entry for a missing image, growing the map and leaving a key
+    //that will dangle (the same bug fixed in removeDependentForPromise).
+    auto entry = _currentDependencySamplerStateMap.find(image);
+    auto result = entry == _currentDependencySamplerStateMap.end() ? nil : entry -> second;
     if (!result || !promise) {
         [NSException raise:NSInternalInconsistencyException format:@"Do not query resolved sampler state for image which is not the current resolving promise's dependency. (Promise: %@, Image: %@)", promise, image];
     }
@@ -228,35 +272,69 @@ MTIContextImageAssociatedValueTableName const MTIContextImagePersistentResolutio
 //St12out_of_range during visualizer preset switching
 //(SlimController #414).
 //
+//SCOPE, three things this deliberately does NOT do:
+//
+// 1. It does not catch NSException. On the 64-bit runtime objc_exception_throw
+//    uses the Itanium C++ ABI, so `catch (...)` WOULD swallow one — including
+//    this library's own deliberate programmer-error traps (nil image below,
+//    the resolved-texture inconsistency checks, MTITexturePool's
+//    over-release detector). Those are assertions about caller misuse and
+//    must keep killing the process, so they are rethrown unchanged.
+// 2. It does not catch Swift runtime traps (fatalError, bounds checks,
+//    forced unwraps). Those are not exceptions at all — they are ud2/abort
+//    and no handler sees them.
+// 3. It is SURVIVE-ONCE, not a per-frame safety net. ObjC (.m) translation
+//    units compile with -fno-objc-arc-exceptions by default, and every
+//    promise and kernel in this library is .m — so an exception unwinding
+//    through them leaks their strong locals permanently, including
+//    MTIReusableTextures that then never return to the pool. One caught
+//    exception is a dropped frame; one per frame is a texture leak. The
+//    context marks itself poisoned so it cannot be reused, and the
+//    MTIPrint below is there so the condition is visible in the field
+//    rather than silently absorbed.
+//
 //Guarded at the OUTERMOST call only: the recursive descent below calls
-//the unguarded variant, so a deep graph does not pay a try/catch per
-//node, and an exception thrown at any depth still unwinds to here.
+//the unguarded variant. Not for speed — table-driven EH is zero-cost on
+//the non-throwing path — but because catching per node would turn one
+//real exception into N nested generic errors and bury the origin.
 - (id<MTIImagePromiseResolution>)resolutionForImage:(MTIImage *)image error:(NSError * __autoreleasing *)inOutError {
+    //Above the guard: a nil image is caller misuse, and the raise below
+    //is load-bearing — the next statement dereferences image.promise.
+    if (image == nil) {
+        [NSException raise:NSInvalidArgumentException format:@"%@: Application is requesting a resolution of a nil image.", self];
+    }
     try {
         return [self unguardedResolutionForImage:image error:inOutError];
+    } catch (NSException *exception) {
+        //An ObjC programmer-error trap. Keep its old behaviour exactly.
+        @throw exception;
     } catch (const std::exception &exception) {
-        if (inOutError) {
-            //Hoisted: MTIErrorCreate is a macro, so a brace-literal with a
-            //comma in it reads as a second argument.
-            NSString *description = [NSString stringWithFormat:@"A C++ exception escaped the render graph: %s", exception.what()];
-            NSDictionary *userInfo = @{NSLocalizedDescriptionKey: description};
-            *inOutError = MTIErrorCreate(MTIErrorRenderGraphException, userInfo);
-        }
+        [self markGraphAsThrownWithReason:[NSString stringWithUTF8String:exception.what()] error:inOutError];
         return nil;
     } catch (...) {
-        if (inOutError) {
-            NSDictionary *userInfo = @{NSLocalizedDescriptionKey: @"An unknown C++ exception escaped the render graph."};
-            *inOutError = MTIErrorCreate(MTIErrorRenderGraphException, userInfo);
-        }
+        [self markGraphAsThrownWithReason:@"unknown C++ exception" error:inOutError];
         return nil;
     }
 }
 
-- (id<MTIImagePromiseResolution>)unguardedResolutionForImage:(MTIImage *)image error:(NSError * __autoreleasing *)inOutError {
-    if (image == nil) {
-        [NSException raise:NSInvalidArgumentException format:@"%@: Application is requesting a resolution of a nil image.", self];
+/// Record that an exception escaped resolution: poison the context,
+/// name the promise that was resolving, and report.
+- (void)markGraphAsThrownWithReason:(NSString *)reason error:(NSError * __autoreleasing *)inOutError {
+    //The promise that was mid-resolution is the single most useful fact
+    //for a field report, and it is still here at catch time. The normal
+    //root-image failure path prints the same way.
+    id<MTIImagePromise> failing = _currentResolvingPromise;
+    NSString *description = [NSString stringWithFormat:@"A C++ exception escaped the render graph: %@ (resolving: %@)", reason, failing ?: @"<none>"];
+    MTIPrint(@"%@", description);
+    _currentResolvingPromise = nil;
+    _graphDidThrow = YES;
+    if (inOutError) {
+        NSDictionary *userInfo = @{NSLocalizedDescriptionKey: description};
+        *inOutError = MTIErrorCreate(MTIErrorRenderGraphException, userInfo);
     }
-    
+}
+
+- (id<MTIImagePromiseResolution>)unguardedResolutionForImage:(MTIImage *)image error:(NSError * __autoreleasing *)inOutError {
     BOOL isRootImage = NO;
     id<MTIImagePromise> promise = image.promise;
     
