@@ -236,14 +236,17 @@ MTIContextImageAssociatedValueTableName const MTIContextImagePersistentResolutio
         return [self unguardedResolutionForImage:image error:inOutError];
     } catch (const std::exception &exception) {
         if (inOutError) {
-            *inOutError = MTIErrorCreate(MTIErrorRenderGraphException,
-                                         @{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"A C++ exception escaped the render graph: %s", exception.what()]});
+            //Hoisted: MTIErrorCreate is a macro, so a brace-literal with a
+            //comma in it reads as a second argument.
+            NSString *description = [NSString stringWithFormat:@"A C++ exception escaped the render graph: %s", exception.what()];
+            NSDictionary *userInfo = @{NSLocalizedDescriptionKey: description};
+            *inOutError = MTIErrorCreate(MTIErrorRenderGraphException, userInfo);
         }
         return nil;
     } catch (...) {
         if (inOutError) {
-            *inOutError = MTIErrorCreate(MTIErrorRenderGraphException,
-                                         @{NSLocalizedDescriptionKey: @"An unknown C++ exception escaped the render graph."});
+            NSDictionary *userInfo = @{NSLocalizedDescriptionKey: @"An unknown C++ exception escaped the render graph."};
+            *inOutError = MTIErrorCreate(MTIErrorRenderGraphException, userInfo);
         }
         return nil;
     }
